@@ -1,11 +1,10 @@
 from flask import Flask, request, redirect, url_for, flash, render_template_string
 from flask_httpauth import HTTPBasicAuth
 from werkzeug.security import generate_password_hash, check_password_hash
+import platform
 import subprocess
 import os
 import json
-import signal
-import atexit
 
 app = Flask(__name__)
 app.secret_key = b'}N\xf5\t\x10\x08W\xf6W>\x93d\x18\xbc\xca\xb3\x10\xf5\xd1\x8d\x98>\x1aa'  # 你的密钥
@@ -15,7 +14,7 @@ auth = HTTPBasicAuth()
 
 # 设置用户名和密码
 users = {
-    "xierlove": generate_password_hash("xierlove")  # 用户名: xierlove, 密码: xierlove
+    "xierlove": generate_password_hash("xierlove")  # 请更改为你想要的用户名和密码
 }
 
 @auth.verify_password
@@ -26,16 +25,13 @@ def verify_password(username, password):
 # 定义规则存储文件路径
 RULES_FILE = '/opt/gost_web/rules.json'
 
-# 定义 GOST 子进程
-gost_process = None
-
 # HTML 模板包含在 Python 字符串中
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>XIERCLOUD转发</title>
+    <title>GOST 转发配置</title>
     <style>
     body {
         font-family: Arial, sans-serif;
@@ -133,7 +129,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="container">
-        <h1>XIERCLOUD转发</h1>
+        <h1>GOST 转发配置</h1>
         <p>当前操作系统：{{ os_type }}</p>
 
         {% with messages = get_flashed_messages(with_categories=true) %}
@@ -208,6 +204,7 @@ def detect_os():
     检测当前操作系统类型。
     """
     try:
+        # 尝试使用 /etc/os-release 文件获取更详细信息
         if os.path.exists('/etc/os-release'):
             with open('/etc/os-release') as f:
                 lines = f.readlines()
@@ -242,36 +239,49 @@ def save_rules(rules):
     with open(RULES_FILE, 'w') as f:
         json.dump(rules, f, indent=4)
 
-def start_gost(rules):
+def update_gost_service(rules):
     """
-    启动 GOST 作为子进程，根据当前规则。
+    根据当前规则生成 systemd 服务文件并重启 GOST 服务。
     """
-    global gost_process
-    if gost_process and gost_process.poll() is None:
-        gost_process.terminate()
-        gost_process.wait()
-
-    if not rules:
-        return
-
     try:
+        if not rules:
+            # 如果没有规则，停止并禁用 GOST 服务
+            subprocess.run(['systemctl', 'stop', 'gost'], check=True)
+            subprocess.run(['systemctl', 'disable', 'gost'], check=True)
+            return
+
+        # 构建 GOST 命令
         gost_path = '/usr/local/bin/gost/gost'  # 根据实际安装路径调整
         cmd = [gost_path]
         for rule in rules:
             cmd.extend(['-L', f"{rule['protocol']}://{rule['local_addr']}:{rule['local_port']}"])
             cmd.extend(['-F', f"{rule['protocol']}://{rule['remote_addr']}:{rule['remote_port']}"])
 
-        gost_process = subprocess.Popen(cmd)
-        print("GOST 服务已启动。")
-    except Exception as e:
-        print(f"启动 GOST 时出错: {e}")
-        gost_process = None
+        # 创建 systemd 服务文件内容
+        service_content = f"""
+[Unit]
+Description=GOST Service
+After=network.target
 
-def update_gost_service(rules):
-    """
-    更新 GOST 服务，根据当前规则。
-    """
-    start_gost(rules)
+[Service]
+ExecStart={' '.join(cmd)}
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+"""
+        service_path = '/etc/systemd/system/gost.service'
+        with open(service_path, 'w') as service_file:
+            service_file.write(service_content)
+
+        # 重新加载 systemd 并启动 GOST 服务
+        subprocess.run(['systemctl', 'daemon-reload'], check=True)
+        subprocess.run(['systemctl', 'enable', 'gost'], check=True)
+        subprocess.run(['systemctl', 'restart', 'gost'], check=True)
+
+    except Exception as e:
+        print(f"更新 GOST 服务时出错: {e}")
 
 @app.route('/', methods=['GET', 'POST'])
 @auth.login_required
@@ -327,22 +337,9 @@ def delete_rule(rule_id):
         flash('无效的规则 ID。', 'danger')
     return redirect(url_for('index'))
 
-def shutdown_gost():
-    """
-    在应用关闭时终止 GOST 子进程。
-    """
-    global gost_process
-    if gost_process and gost_process.poll() is None:
-        gost_process.terminate()
-        gost_process.wait()
-        print("GOST 服务已停止。")
-
-atexit.register(shutdown_gost)
-
 if __name__ == '__main__':
-    # 在容器启动时加载并启动 GOST
-    rules = load_rules()
-    update_gost_service(rules)
-
-    # 启动 Flask 应用
+    # 以 root 用户运行以便管理 systemd 服务
+    if os.geteuid() != 0:
+        print("请以 root 用户运行此应用。")
+        exit(1)
     app.run(host='0.0.0.0', port=5000)
